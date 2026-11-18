@@ -1,0 +1,372 @@
+--[[
+    CombatService.lua
+    Server-side combat management using the Knit framework.
+    Handles M1 combo tracking, timing windows, utility cleaning, state checks, and moveset execution.
+]]
+
+-- Knit API made by Sleitnick
+local Knit = require(game.ReplicatedStorage.Packages.Knit)
+local Signal = require(game.ReplicatedStorage.Packages.Signal)
+local Types = require(game.ReplicatedStorage.Configs.Types)
+
+local runService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+-- Register the CombatService within the Knit ecosystem
+local CombatService = Knit.CreateService({
+	Name = "CombatService",
+	Client = {
+		-- Client-accessible signal for triggering or replicating actions
+		PerformAction = Knit.CreateSignal()
+	}
+})
+
+-- State Tracking Tables
+local M1Combos = {}       -- Maps Player/Model instances or UserIds to their current combo count
+local M1ResetTimers = {}  -- Stores active coroutines responsible for resetting combo counts
+local ActorAnimations = {}-- Tracks active animation tracks or states for characters
+
+-- Utility: Cleans input strings by stripping HTML-like tags and non-alphanumeric characters
+local function cleanString(str) : string
+	str = str:gsub("<br%s*/>", "\n")
+	str = str:gsub("<[^<>]->", "")
+	str = str:gsub("[^%w]", "")
+
+	return str
+end
+
+-- Utility: Iterates through a table's keys, cleans them, and checks if a target pattern exists
+local function findPattern(givenTable, pattern)
+	for i, v in pairs(givenTable) do
+		if string.find(cleanString(i), pattern) then
+			return true
+		end
+	end
+	
+	return false
+end
+
+-- Configuration settings for M1 combo timing windows (in seconds)
+local M1Configs = {
+	normal = 1.5, -- Window allowed before a normal attack combo resets
+	fourth = 2.5  -- Extended window or recovery time after the finisher/4th hit
+}
+
+-- Server-side signal for combat action events
+CombatService.PerformAction = Signal.new()
+
+-- Schedules a reset of the user's M1 combo back to 1 if they idle longer than the specified duration
+local function ScheduleM1Reset(user:Player|Model, duration:number)
+	if user:IsA("Player") then
+		-- Coroutine handler for human players (keyed by UserId)
+		local m1Timer = coroutine.create(function()
+			local startTime = os.clock()
+
+			while (os.clock() - startTime) < duration do
+				task.wait(0.1)
+			end
+			-- Reset combo count back to the start after timeout expires
+			M1Combos[user.UserId] = 1
+		end)
+		M1ResetTimers[user.UserId] = m1Timer
+		task.spawn(M1ResetTimers[user.UserId])
+	else
+		-- Coroutine handler for AI/NPC Models (keyed directly by Model instance)
+		local m1Timer = coroutine.create(function()
+			local startTime = os.clock()
+
+			while (os.clock() - startTime) < duration do
+				task.wait(0.1)
+			end
+			-- Reset combo count back to the start after timeout expires
+			M1Combos[user] = 1
+		end)
+		M1ResetTimers[user] = m1Timer
+		task.spawn(M1ResetTimers[user])
+	end
+
+end
+
+--[[
+-- Utility conversion function for directional vectors (currently commented out)
+function cardinalConvert(dir)
+	local angle = math.atan2(dir.X, -dir.Z)
+	local quarterTurn = math.pi / 2
+	angle = -math.round(angle / quarterTurn) * quarterTurn
+
+	local newX = -math.sin(angle)
+	local newZ = -math.cos(angle)
+	if math.abs(newX) <= 1e-10 then newX = 0 end
+	if math.abs(newZ) <= 1e-10 then newZ = 0 end
+	return Vector3.new(newX, 0, newZ)
+end
+]]
+
+-- Checks if an actor is currently able to perform a specific action based on the StateManager
+function CombatService:CanPerform(actor, action:string)
+	local StateManager = Knit.GetService("StateManager")
+	local actorState = actor:GetState()
+	
+	if not actorState then return end
+	if actor.Character:GetAttribute("IsRagdoll") == true or actor.Humanoid.Health <= 0 then return false end
+	
+	local response = StateManager:GetDefinitions(actorState)[action]
+	return response
+end
+
+function CombatService.Client:CanPerform(user, action:string)
+	local actor = CombatService:GetActor(user)
+	return CombatService:CanPerform(actor, action)
+end
+
+function CombatService.Client:GetActor(player:Player)
+	return CombatService:GetActor(player)
+end
+
+-- Constructs a standardized wrapper object ("actor") for both Players and NPCs to handle animations, states, and properties uniformly
+function CombatService:GetActor(user:Player|Model)
+	local PlayerProfiler = Knit.GetService("PlayerProfiler")
+	local CombatService = Knit.GetService("CombatService")
+	local StateManager = Knit.GetService("StateManager")
+	local AnimationService = Knit.GetService("AnimationService")
+	
+	if not user then return end
+	
+	if user:IsA("Player") or Players:GetPlayerFromCharacter(user) then
+		local player = nil
+
+		if user:IsA("Model") then player = Players:GetPlayerFromCharacter(user)
+		else player = user
+		end
+		
+		local profile = PlayerProfiler:GetPlayerProfile(player)
+		
+		if not ActorAnimations[player.UserId] then ActorAnimations[player.UserId] = {} end
+	
+		return {
+			Id = player.UserId,
+			Player = player,
+			Character = profile.Character,
+			Humanoid = profile.Character:FindFirstChildOfClass("Humanoid"),
+			Profile = profile,
+			Moveset = profile.Moveset,
+			Type = "Player",
+
+			GetState = function()
+				if not StateManager:GetState(player) then return end
+				return StateManager:GetState(player)
+			end,
+
+			SetState = function(state, duration:number?)
+				StateManager:GetStateMachine(player.UserId).ChangeState(state, duration)
+			end,
+
+			LoadAnimation = function(animationData)
+				local preloadedAnim = ActorAnimations[player.UserId][animationData.AnimationId]
+				local anim = AnimationService:LoadAnimation(profile.Character, {
+					character = profile.Character,
+					animation = animationData.AnimationId,
+					markers = animationData.Markers,
+					Priority = animationData.Priority,
+					fadeTime = animationData.FadeTime,
+					weight = animationData.Weight,
+					speed = animationData.Speed,
+					doesLoop = animationData.DoesLoop,
+				})
+				
+				if not preloadedAnim then ActorAnimations[player.UserId][animationData.AnimationId] = anim end
+			
+				return if not preloadedAnim then anim else preloadedAnim
+			end,
+			
+			StopAnimation = function(animationData)
+				local anim = AnimationService:LoadAnimation(profile.Character, {
+					character = profile.Character,
+					animation = animationData.AnimationId,
+					markers = animationData.Markers,
+					Priority = animationData.Priority,
+					fadeTime = animationData.FadeTime,
+					weight = animationData.Weight,
+					speed = animationData.Speed,
+					doesLoop =animationData.DoesLoop,
+				})
+				
+				anim:Stop()
+			end,
+			
+			Animations = ActorAnimations[player.UserId],
+		}
+	end
+
+	if not ActorAnimations[user] then ActorAnimations[user] = {} end
+
+	return {
+		Id = user,
+		Character = user,
+		Type = "NPC",
+		Humanoid = user:FindFirstChildOfClass("Humanoid"),
+		Moveset = "FlowerMan",
+
+		GetState = function()
+			if not StateManager:GetState(user) then return end
+			return StateManager:GetState(user)
+		end,
+
+		SetState = function(state, duration:number?)
+			StateManager:GetStateMachine(user).ChangeState(state, duration)
+		end,
+
+		LoadAnimation = function(animationData)
+			print(animationData)
+			return AnimationService:LoadAnimation(user, {
+				character = user,
+				animation = animationData.AnimationId,
+				markers = animationData.Markers,
+				Priority = animationData.Priority,
+				fadeTime = animationData.FadeTime,
+				weight = animationData.Weight,
+				speed = animationData.Speed,
+				doesLoop =animationData.DoesLoop,
+			})
+		end,
+		
+		StopAnimation = function(animationData)
+			local anim = AnimationService:LoadAnimation(user, {
+				character = user,
+				animation = animationData.AnimationId,
+				markers = animationData.Markers,
+				Priority = animationData.Priority,
+				fadeTime = animationData.FadeTime,
+				weight = animationData.Weight,
+				speed = animationData.Speed,
+				doesLoop =animationData.DoesLoop,
+			})
+
+			anim:Stop()
+		end,
+	}
+end
+
+-- Dictionary mapping incoming combat actions to their server-side handling logic
+local logic = {
+	M1 = function(user:Player|Model, data)
+		local actor = CombatService:GetActor(user)
+		-- Ensure the actor is allowed to attack and perform M1s
+		if not CombatService:CanPerform(actor, "CanAttack") or not CombatService:CanPerform(actor, "CanM1") then return end
+		
+		local currentCombo = M1Combos[actor.Id]
+		if not currentCombo then 
+			M1Combos[actor.Id] = 1 
+			currentCombo = M1Combos[actor.Id]
+		end 
+
+		if currentCombo > 4 then return end -- Failsafe against invalid combo counts
+
+		-- Clear any active reset timer since the player is continuing their combo chain
+		if M1ResetTimers[actor.Id] then 
+			task.cancel(M1ResetTimers[actor.Id])
+			M1ResetTimers[actor.Id] = nil
+		end
+		
+		-- Callback function passed into the moveset to evaluate whether the 4th/finisher hit connected
+		local function onHitResult(hitSuccess: boolean)
+			if currentCombo == 4 then
+				if not hitSuccess then
+					-- Reminder requirement: If the player misses the last/fourth M1, they get stunned
+					actor.SetState("Stunned", 1.5)
+					M1Combos[actor.Id] = 1
+				else
+					-- If it hits, reset combo and allow immediate follow-up actions
+					M1Combos[actor.Id] = 1
+				end
+			end
+		end
+
+		local selectedCharacter = "FlowerMan" -- Placeholder for a dynamic character selection retriever
+		require(script[actor.Moveset]):PerformAction("M1", actor, data, currentCombo, onHitResult)
+
+		-- Schedule a reset if they fail to input the next attack within the allotted window
+		ScheduleM1Reset(user, if currentCombo ~= 4 then M1Configs.normal else M1Configs.fourth)
+		
+		-- Increment combo count if below 4; otherwise, handle transition
+		if currentCombo < 4 then
+			M1Combos[actor.Id] = currentCombo + 1
+		end
+	end,
+	
+	BeginBlock = function(user:Player|Model)
+		local actor = CombatService:GetActor(user)
+		if not CombatService:CanPerform(actor, "CanBlock") then return end
+
+		local selectedCharacter = "FlowerMan"
+		require(script[selectedCharacter]):PerformAction("BeginBlock", actor)
+	end,
+	
+	EndBlock = function(user:Player|Model)
+		local actor = CombatService:GetActor(user)
+		if not CombatService:CanPerform(actor, "CanBlock") then return end
+		if actor:GetState() ~= "Blocking" then return end
+		
+		local selectedCharacter = "FlowerMan"
+		require(script[selectedCharacter]):PerformAction("EndBlock", actor)
+	end,
+	
+	Skill = function(user:Player|Model, skillData:Types.SkillParams) -- NPCs cannot use skills yet
+		local actor = CombatService:GetActor(user)
+		if not CombatService:CanPerform(actor, "CanUseSkills") then return end
+		
+		if not findPattern(actor.Profile.Skills, skillData.skill) then warn("HUUHHH?!?!?!") return end
+
+		local selectedCharacter = "FlowerMan"
+		require(script[selectedCharacter]):PerformAction("UseSkill", actor, skillData)
+	end,
+	
+	CancelSkill = function(user:Player|Model, skillData:Types.SkillParams) -- NPCs cannot use skills yet
+		local actor = CombatService:GetActor(user)
+		if not CombatService:CanPerform(actor, "CanUseSkills") then return end
+		
+		if not findPattern(actor.Profile.Skills, skillData.skill) then warn("HUUHHH?!?!?!") return end
+
+		local selectedCharacter = "FlowerMan"
+		require(script[selectedCharacter]):PerformAction("CancelSkill", skillData)
+	end,
+	
+	Dash = function(user:Player|Model, data)
+		local actor = CombatService:GetActor(user)
+		local hum:Humanoid = actor.Humanoid
+		
+		local direction = data.direction		
+	end,
+}
+
+-- Knit lifecycle method called when the service is initializing
+function CombatService:KnitInit()
+	print("CombatService was initiated!")
+	local StateManager = Knit.GetService("StateManager")
+	
+	-- Connect remote client requests to respective action logic
+	self.Client.PerformAction:Connect(function(player:Player, action:string, data)
+		if action == "CancelSkill" then return end -- Clients do not have direct access to cancel skills
+		local actionLogic = logic[action]
+		if not actionLogic then return end
+		if not StateManager:GetStateMachine(player) then return end
+		
+		actionLogic(player, data)
+	end)
+	
+	-- Connect server-side action calls (for AI/NPCs or direct server triggers)
+	CombatService.PerformAction:Connect(function(user:Player, action:string, data)
+		local actionLogic = logic[action]
+		if not actionLogic then return end
+
+		actionLogic(user, data)
+	end)
+end
+
+-- Knit lifecycle method called when all services have started up
+function CombatService:KnitStart()
+	local PlayerProfiler = Knit.GetService("PlayerProfiler")
+	print("CombatService has been started!")
+end
+
+return CombatService
