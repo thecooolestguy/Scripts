@@ -1,4 +1,4 @@
-``` lua
+```lua
 --[[
     CombatService.lua
     Server-side combat management using the Knit framework.
