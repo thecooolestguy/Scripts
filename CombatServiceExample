@@ -1,3 +1,4 @@
+``` lua
 --[[
     CombatService.lua
     Server-side combat management using the Knit framework.
@@ -370,3 +371,4 @@ function CombatService:KnitStart()
 end
 
 return CombatService
+```
